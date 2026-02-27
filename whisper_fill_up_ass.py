@@ -458,7 +458,7 @@ def main():
     ap.add_argument("--output-format", default="txt", help="Output format. Default: txt")
     ap.add_argument("--task", default="transcribe", help="Task. Default: transcribe")
     ap.add_argument("--whisper-output-dir", default=None, help="Optional: directory for whisper outputs (srt). If omitted, use whisper default (same dir as input wav).")
-    ap.add_argument("--max-parallel", type=int, default=8, help="Max concurrent faster-whisper jobs. Default: 4")
+    ap.add_argument("--max-parallel", type=int, default=8, help="Max concurrent faster-whisper jobs. Default: 8")
 
     ap.add_argument("--debug", action="store_true", help="Enable debug logging for ffmpeg and faster-whisper.")
     ap.add_argument("--debug-dir", default=None, help="Optional: directory for debug logs. Default: <out_dir>/_debug_logs or <whisper_out>/_debug_logs")
@@ -539,4 +539,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
