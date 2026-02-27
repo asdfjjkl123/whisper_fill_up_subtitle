@@ -3,6 +3,14 @@ Using faster whisper to generate text base on ass subtitle time
 
 使用faster whisper根據ass字幕行的時間進行音頻轉文字
 
+## Feature 特點
+ - Enter assb lines, whisper will generate the text for the lines.
+ - 輸入ass空白行, whisper會生成對應行的文字
+ - Audio is segmented based on the ASS line time to avoid long blank segments that allow the whisper to create text by itself.
+ - 根據ass行時間切割音頻, 避免長空白段讓whisper自行創作
+ - The number of sentences in the output file is the same as the number of ASS lines in the input file, so there will be no mismatch in sentence count due to Whisper's automatic sentence segmentation.
+ - 輸出文件句子數與輸入文件的ass行數相同, 不會出現因whisper自動分句而句子數不對應
+
 ## Workflow Overview 流程
 ```
 ASS Events (.txt)
