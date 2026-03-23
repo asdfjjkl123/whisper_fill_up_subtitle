@@ -7,9 +7,13 @@ import shlex
 import subprocess
 import time
 import os
+import gc
 from pathlib import Path
 from typing import List, Tuple, Optional
 from datetime import datetime
+from faster_whisper import WhisperModel
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 ASS_DIALOGUE_PREFIX = "Dialogue:"
 ASS_COMMENT_PREFIX = "Comment:"
@@ -49,6 +53,17 @@ def read_text_file(path: Path) -> List[str]:
         except UnicodeDecodeError:
             continue
     return path.read_text(errors="replace").splitlines()
+
+
+def clear_directory(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise NotADirectoryError(f"Expected directory path, got file: {path}")
+
+    for child in path.iterdir():
+        if child.is_file() and re.fullmatch(r"\d+\.(?:txt|wav)", child.name):
+            child.unlink()
 
 
 def extract_segments_from_ass_events(lines: List[str]) -> List[Tuple[float, float]]:
@@ -114,21 +129,20 @@ def run_ffmpeg_split_wavs(
     media_path: Path,
     segments: List[Tuple[float, float]],
     out_dir: Path,
-    batch_size: int = 16,
+    batch_size: int = 24,
     batch_interval: int = 1,
     debug: bool = False,
     debug_dir: Optional[Path] = None,
 ) -> List[Path]:
     """
-    Fire-and-forget batching (default):
-      - Launch batch_size ffmpeg processes concurrently
-      - Immediately sleep batch_interval seconds
-      - Launch next batch (no waiting)
+    Use ThreadPoolExecutor to run ffmpeg segment-splitting jobs in parallel.
+    At most batch_size ffmpeg processes run concurrently.
+    Return only after all jobs have finished successfully.
 
-    If debug=True:
-      - Capture stdout/stderr for EACH ffmpeg job into log files
-      - Wait for all ffmpeg jobs to finish before returning (to ensure logs are complete)
+    batch_interval is kept only for compatibility and is unused.
     """
+    import concurrent.futures
+
     if not segments:
         raise RuntimeError("No valid segments parsed from the txt/ass events.")
 
@@ -139,15 +153,17 @@ def run_ffmpeg_split_wavs(
             debug_dir = out_dir / "_debug_logs"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-    wav_paths: List[Path] = []
-    procs: List[dict] = []
+    batch_size = max(1, int(batch_size))
 
-    batch_count = 0
+    jobs: List[dict] = []
+    wav_paths: List[Path] = []
+
     for idx, (st, ed) in enumerate(segments, start=1):
         out_wav = out_dir / f"{idx}.wav"
         cmd = [
             "ffmpeg",
             "-hide_banner",
+            "-loglevel", "error",
             "-y",
             "-i", str(media_path),
             "-ss", f"{st:.6f}",
@@ -157,9 +173,38 @@ def run_ffmpeg_split_wavs(
             str(out_wav),
         ]
 
+        job = {
+            "idx": idx,
+            "start": st,
+            "end": ed,
+            "wav": out_wav,
+            "cmd": cmd,
+        }
         if debug:
-            log_path = debug_dir / f"ffmpeg_{idx:04d}.log"
-            p = subprocess.Popen(
+            job["log"] = debug_dir / f"ffmpeg_{idx:04d}.log"
+
+        jobs.append(job)
+        wav_paths.append(out_wav)
+
+    total_jobs = len(jobs)
+
+    def _run_single_job(job: dict) -> int:
+        idx = job["idx"]
+        out_wav: Path = job["wav"]
+        cmd = job["cmd"]
+
+        if debug:
+            log_path: Path = job["log"]
+            with log_path.open("w", encoding="utf-8", errors="replace") as f:
+                f.write(f"[START] {datetime.now().isoformat(timespec='seconds')}\n")
+                f.write(f"idx={idx}\n")
+                f.write(f"segment_start={job['start']:.6f}\n")
+                f.write(f"segment_end={job['end']:.6f}\n")
+                f.write(f"wav={out_wav}\n")
+                f.write("cmd=" + " ".join(shlex.quote(c) for c in cmd) + "\n")
+                f.write("-" * 80 + "\n")
+
+            result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -167,17 +212,19 @@ def run_ffmpeg_split_wavs(
                 encoding="utf-8",
                 errors="replace",
             )
-            # 先寫入 header，避免中途崩潰沒資訊
-            with log_path.open("w", encoding="utf-8", errors="replace") as f:
-                f.write(f"[START] {datetime.now().isoformat(timespec='seconds')}\n")
-                f.write(f"idx={idx}\n")
-                f.write(f"wav={out_wav}\n")
-                f.write("cmd=" + " ".join(shlex.quote(c) for c in cmd) + "\n")
+
+            with log_path.open("a", encoding="utf-8", errors="replace") as f:
+                f.write(f"[END] {datetime.now().isoformat(timespec='seconds')} returncode={result.returncode}\n")
                 f.write("-" * 80 + "\n")
-            procs.append({"proc": p, "wav": out_wav, "cmd": cmd, "log": log_path})
+                f.write("[STDOUT]\n")
+                f.write((result.stdout or "").rstrip() + "\n")
+                f.write("-" * 80 + "\n")
+                f.write("[STDERR]\n")
+                f.write((result.stderr or "").rstrip() + "\n")
+                f.write("-" * 80 + "\n")
+                f.write(f"[OUTPUT_EXISTS] {out_wav.exists()}\n")
         else:
-            # 原本行為：只抓 stderr、不等待
-            p = subprocess.Popen(
+            result = subprocess.run(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -185,59 +232,64 @@ def run_ffmpeg_split_wavs(
                 encoding="utf-8",
                 errors="replace",
             )
-            procs.append({"proc": p, "wav": out_wav, "cmd": cmd})
 
-        wav_paths.append(out_wav)
+        if result.returncode != 0:
+            err_msg = (result.stderr or "").strip()
+            raise RuntimeError(
+                f"ffmpeg failed for wav #{idx} -> {out_wav}\n"
+                f"returncode={result.returncode}\n"
+                f"{err_msg}"
+            )
 
-        if len(procs) % batch_size == 0:
-            batch_count += 1
-            print(f"[Batch {batch_count}] Launched {batch_size} ffmpeg processes. Sleeping {batch_interval}s...")
-            time.sleep(batch_interval)
+        if not out_wav.exists():
+            raise RuntimeError(f"ffmpeg finished but output not found: {out_wav}")
 
-    # debug 模式：等待所有 ffmpeg 完成並寫完整 log
-    if debug:
-        for item in procs:
-            p: subprocess.Popen = item["proc"]
-            log_path: Path = item["log"]
-            stdout, stderr = p.communicate()
-            rc = p.returncode
+        return idx
 
-            with log_path.open("a", encoding="utf-8", errors="replace") as f:
-                f.write(f"[END] {datetime.now().isoformat(timespec='seconds')} returncode={rc}\n")
-                f.write("-" * 80 + "\n")
-                f.write("[STDOUT]\n")
-                f.write((stdout or "").rstrip() + "\n")
-                f.write("-" * 80 + "\n")
-                f.write("[STDERR]\n")
-                f.write((stderr or "").rstrip() + "\n")
-                f.write("-" * 80 + "\n")
-                f.write(f"[OUTPUT_EXISTS] {item['wav'].exists()}\n")
+    completed = 0
+    progress_lock = threading.Lock()
+    progress_line_len = 0
 
+    def _print_progress() -> None:
+        nonlocal progress_line_len
+        line = f"[FFmpeg] finished {completed}/{total_jobs}"
+        pad = max(0, progress_line_len - len(line))
+        print("\r" + line + (" " * pad), end="", flush=True)
+        progress_line_len = len(line)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
+        future_to_job = {
+            executor.submit(_run_single_job, job): job
+            for job in jobs
+        }
+
+        try:
+            for future in concurrent.futures.as_completed(future_to_job):
+                future.result()
+                with progress_lock:
+                    completed += 1
+                    _print_progress()
+        except Exception:
+            for future in future_to_job:
+                future.cancel()
+            raise
+
+    print()
     return wav_paths
 
 
 def run_whisper_batch(
     wav_paths: List[Path],
-    model: str = "large-v3",
-    device: str = "cuda",
-    output_format: str = "srt",
+    whisper_model,
+    output_format: str = "txt",
     task: str = "transcribe",
     language: str = "ja",
-    whisper_cmd: str = "whisper-ctranslate2",
-    model_dir: Optional[str] = None,
     output_dir: Optional[Path] = None,
-    max_parallel: int = 2,
     debug: bool = False,
     debug_dir: Optional[Path] = None,
+    max_parallel: int = 2,
 ) -> None:
-    """
-    faster-whisper (whisper-ctranslate2) with a concurrency cap:
-      - Keep at most `max_parallel` jobs running
-      - As soon as any job finishes, launch the next
 
-    If debug=True:
-      - Capture stdout/stderr and write per-wav log file
-    """
     if not wav_paths:
         return
 
@@ -245,104 +297,117 @@ def run_whisper_batch(
         output_dir.mkdir(parents=True, exist_ok=True)
 
     base_dir = output_dir if output_dir is not None else wav_paths[0].parent
+
     if debug:
         if debug_dir is None:
             debug_dir = base_dir / "_debug_logs"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-    def build_cmd(wav: Path) -> List[str]:
-        cmd = [
-            whisper_cmd,
-            str(wav),
-            "--model", model,
-            "--device", device,
-            "--output_format", output_format,
-            "--task", task,
-            "--language", language,
-        ]
-        if model_dir:
-            cmd += ["--model_dir", model_dir]
-        if output_dir is not None:
-            cmd += ["--output_dir", str(output_dir)]
-        return cmd
+    max_parallel = max(1, int(max_parallel))
+    total = len(wav_paths)
+    group_size = (total + max_parallel - 1) // max_parallel  # ceil(total / max_parallel)
 
-    pending = list(wav_paths)
-    running: List[dict] = []
+    indexed_wavs = list(enumerate(wav_paths, start=1))
+    groups: List[List[Tuple[int, Path]]] = [
+        indexed_wavs[i:i + group_size]
+        for i in range(0, total, group_size)
+    ]
 
-    def launch_one(wav: Path, idx: int) -> None:
-        cmd = build_cmd(wav)
-        print("Launch:", " ".join(shlex.quote(c) for c in cmd))
+    progress_lock = threading.Lock()
+    progress_state = {gid: 0 for gid in range(1, len(groups) + 1)}
+    progress_totals = {gid: len(gitems) for gid, gitems in enumerate(groups, start=1)}
+    progress_line_len = 0
 
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
+    def render_progress_locked(done_suffix: bool = False) -> None:
+        nonlocal progress_line_len
+        parts = []
+        for gid in range(1, len(groups) + 1):
+            parts.append(f"[Group {gid}] {progress_state[gid]}/{progress_totals[gid]}")
+        line = "[Whisper] " + " ".join(parts)
+        if done_suffix:
+            line += " done"
+        pad = max(0, progress_line_len - len(line))
+        print("\r" + line + (" " * pad), end="", flush=True)
+        progress_line_len = len(line)
 
-        log_path = None
-        if debug:
-            log_path = debug_dir / f"whisper_{idx:04d}.log"
-            with log_path.open("w", encoding="utf-8", errors="replace") as f:
-                f.write(f"[START] {datetime.now().isoformat(timespec='seconds')}\n")
-                f.write(f"idx={idx}\n")
-                f.write(f"wav={wav}\n")
-                f.write("cmd=" + " ".join(shlex.quote(c) for c in cmd) + "\n")
-                f.write("-" * 80 + "\n")
+    with progress_lock:
+        render_progress_locked(done_suffix=False)
 
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE if debug else subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-        )
-        running.append({"proc": p, "wav": wav, "cmd": cmd, "idx": idx, "log": log_path})
+    def _process_group(group_id: int, group_items: List[Tuple[int, Path]]) -> None:
+        for local_idx, (idx, wav) in enumerate(group_items, start=1):
+            out_dir = output_dir if output_dir is not None else wav.parent
+            txt_path = out_dir / f"{idx}.txt"
 
-    # prime
-    next_idx = 1
-    while pending and len(running) < max_parallel:
-        launch_one(pending.pop(0), next_idx)
-        next_idx += 1
-
-    # run
-    while running:
-        any_finished = False
-        for i in range(len(running) - 1, -1, -1):
-            item = running[i]
-            p: subprocess.Popen = item["proc"]
-            if p.poll() is None:
-                continue
-
-            stdout, stderr = p.communicate()
-            rc = p.returncode
-            any_finished = True
-            running.pop(i)
-
-            if debug and item["log"] is not None:
-                with Path(item["log"]).open("a", encoding="utf-8", errors="replace") as f:
-                    f.write(f"[END] {datetime.now().isoformat(timespec='seconds')} returncode={rc}\n")
+            log_path = None
+            if debug:
+                log_path = debug_dir / f"whisper_{idx:04d}.log"
+                with log_path.open("w", encoding="utf-8", errors="replace") as f:
+                    f.write(f"[START] {datetime.now().isoformat(timespec='seconds')}\n")
+                    f.write(f"group={group_id}\n")
+                    f.write(f"group_local_idx={local_idx}\n")
+                    f.write(f"group_total={len(group_items)}\n")
+                    f.write(f"global_idx={idx}\n")
+                    f.write(f"wav={wav}\n")
                     f.write("-" * 80 + "\n")
-                    f.write("[STDOUT]\n")
-                    f.write((stdout or "").rstrip() + "\n")
-                    f.write("-" * 80 + "\n")
-                    f.write("[STDERR]\n")
-                    f.write((stderr or "").rstrip() + "\n")
 
-            # launch next
-            if pending:
-                launch_one(pending.pop(0), next_idx)
-                next_idx += 1
+            start = time.time()
 
-        if not any_finished:
-            time.sleep(0.2)
+            try:
+                segments, info = whisper_model.transcribe(
+                    str(wav),
+                    task=task,
+                    language=language,
+                    beam_size=5,
+                    condition_on_previous_text=False,
+                )
+
+                text = " ".join(seg.text.strip() for seg in segments).strip()
+                txt_path.write_text(text + "\n", encoding="utf-8")
+
+                if debug and log_path is not None:
+                    with log_path.open("a", encoding="utf-8", errors="replace") as f:
+                        f.write(f"[TEXT]\n{text}\n")
+                        f.write("-" * 80 + "\n")
+
+            except Exception as e:
+                if debug and log_path is not None:
+                    with log_path.open("a", encoding="utf-8", errors="replace") as f:
+                        f.write(f"[ERROR]\n{repr(e)}\n")
+                raise
+
+            end = time.time()
+
+            if debug and log_path is not None:
+                with log_path.open("a", encoding="utf-8", errors="replace") as f:
+                    f.write(f"[END] duration={end-start:.2f}s\n")
+                    f.write(f"[OUTPUT] {txt_path}\n")
+
+            with progress_lock:
+                progress_state[group_id] = local_idx
+                render_progress_locked(done_suffix=False)
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(groups)) as ex:
+            futures = [
+                ex.submit(_process_group, group_id, group_items)
+                for group_id, group_items in enumerate(groups, start=1)
+            ]
+            for fut in as_completed(futures):
+                fut.result()
+    finally:
+        with progress_lock:
+            all_done = all(progress_state[gid] == progress_totals[gid] for gid in progress_state)
+            render_progress_locked(done_suffix=all_done)
+            print()
 
 
 
 def merge_whisper_txts(
     wav_paths: List[Path],
     whisper_output_dir: Optional[Path],
+    merged_output_dir: Path,
     merged_name: str,
-    ass: bool = False,
+    ass: bool = True,
     txt_events_path: Optional[Path] = None,
 ) -> Path:
     """
@@ -359,11 +424,13 @@ def merge_whisper_txts(
       - For each whisper txt, if it has multiple lines, join into one line using spaces.
     """
     if not wav_paths:
-        raise ValueError("wav_paths is empty; cannot infer default txt output directory.")
+        raise ValueError("wav_paths is empty; cannot infer whisper txt directory.")
 
     txt_dir = Path(whisper_output_dir) if whisper_output_dir is not None else wav_paths[0].parent
     if not txt_dir.exists():
         raise FileNotFoundError(f"Whisper txt directory not found: {txt_dir}")
+
+    merged_dir = Path(merged_output_dir)
 
     txt_files = sorted(
         txt_dir.glob("*.txt"),
@@ -424,12 +491,12 @@ def merge_whisper_txts(
 
         # If there are extra whisper lines (more txt than Dialogue lines), we ignore by default.
         # If you prefer strictness, turn this into an error.
-        out_path = txt_dir / merged_name
+        out_path = merged_dir / merged_name
         out_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
         return out_path
 
     # --- TXT merge mode (original behavior) ---
-    out_path = txt_dir / merged_name
+    out_path = merged_dir / merged_name
     out_path.write_text("\n".join(whisper_lines) + "\n", encoding="utf-8")
     return out_path
 
@@ -440,17 +507,15 @@ def main():
     )
     ap.add_argument("-i", "--input", required=True, help="Input media file (video/audio).")
     ap.add_argument("-t", "--txt", required=True, help="ASS/SSA txt file containing Events Dialogue lines.")
-    ap.add_argument(
-        "-o", "--output", default=None,
-        help="Output directory for split WAVs. Default: <input_stem>_chunks"
-    )
+    ap.add_argument("--output_wav", default=None, help="Output directory for split WAVs. Default: <input_stem>_chunks")
     ap.add_argument("--padding-ms", type=float, default=50.0, help="Padding added to BOTH start and end (milliseconds). Default 50")
     ap.add_argument("--include-comments", action="store_true", help="Also parse Comment: lines (default: only Dialogue:).")
     ap.add_argument("--ass", action="store_true", help="If set, generate an ASS events file by replacing Dialogue text with whisper outputs.")
+    ap.add_argument("--ffmpeg-batch-size", type=int, default=24, help="Max parallel ffmpeg processes (default: 24)")
+    ap.add_argument("--max-parallel", type=int, default=2, help="Whisper parallel groups. Default: 2")
 
     # faster-whisper (whisper-ctranslate2) related options
     ap.add_argument("--no-whisper", action="store_true", help="Only split WAVs; do not run faster-whisper.")
-    ap.add_argument("--whisper-cmd", default="whisper-ctranslate2", help="Executable in PATH. Default: whisper-ctranslate2")
     ap.add_argument("--model", default="large-v3", help="Model name. Default: large-v3")
     ap.add_argument("--model-dir", default=None, help="Model cache dir. Default: None")
     ap.add_argument("--device", default="cuda", help="Device. Default: cuda")
@@ -458,7 +523,6 @@ def main():
     ap.add_argument("--output-format", default="txt", help="Output format. Default: txt")
     ap.add_argument("--task", default="transcribe", help="Task. Default: transcribe")
     ap.add_argument("--whisper-output-dir", default=None, help="Optional: directory for whisper outputs (srt). If omitted, use whisper default (same dir as input wav).")
-    ap.add_argument("--max-parallel", type=int, default=8, help="Max concurrent faster-whisper jobs. Default: 8")
 
     ap.add_argument("--debug", action="store_true", help="Enable debug logging for ffmpeg and faster-whisper.")
     ap.add_argument("--debug-dir", default=None, help="Optional: directory for debug logs. Default: <out_dir>/_debug_logs or <whisper_out>/_debug_logs")
@@ -472,9 +536,13 @@ def main():
     if not txt_path.exists():
         raise SystemExit(f"Txt not found: {txt_path}")
 
-    out_dir = Path(args.output) if args.output else in_path.with_name(in_path.stem + "_chunks")
+    out_dir = Path(args.output_wav) if args.output_wav else in_path.with_name(in_path.stem + "_chunks")
     whisper_out_dir = Path(args.whisper_output_dir) if args.whisper_output_dir else None
     debug_dir = Path(args.debug_dir) if args.debug_dir else None
+
+    clear_directory(out_dir)
+    if whisper_out_dir is not None:
+        clear_directory(whisper_out_dir)
 
     lines = read_text_file(txt_path)
 
@@ -506,38 +574,54 @@ def main():
     if not padded:
         raise SystemExit("No segments after padding/clamping.")
 
-    wavs = run_ffmpeg_split_wavs(in_path, padded, out_dir, debug=args.debug, debug_dir=debug_dir)
-    print(f"Done split: {out_dir} ({len(wavs)} wav files)")
+    wavs = run_ffmpeg_split_wavs(in_path, padded, out_dir, debug=args.debug, debug_dir=debug_dir, batch_size=args.ffmpeg_batch_size)
+    print(f"\nDone split: {out_dir} ({len(wavs)} wav files)\n")
 
     if not args.no_whisper:
+        
+        compute_type = "float16" if args.device == "cuda" else "int8"
+
+        print(f"[Whisper] Loading model: {args.model} (device={args.device})")
+        whisper_model = WhisperModel(
+            args.model,
+            device=args.device,
+            compute_type=compute_type,
+            download_root=args.model_dir,
+        )
+        print("[Whisper] Model loaded")
+
         run_whisper_batch(
             wavs,
-            model=args.model,
-            device=args.device,
+            whisper_model=whisper_model,
             output_format=args.output_format,
             task=args.task,
             language=args.language,
-            whisper_cmd=args.whisper_cmd,
-            model_dir=args.model_dir,
             output_dir=whisper_out_dir,
-            max_parallel=args.max_parallel,
             debug=args.debug,
             debug_dir=debug_dir,
+            max_parallel=args.max_parallel,
         )
-        print("Done faster-whisper.")
+        print("\nDone faster-whisper.")
 
         merged_name = f"{in_path.stem}_subtitle.txt"
         merged_path = merge_whisper_txts(
             wav_paths=wavs,
             whisper_output_dir=whisper_out_dir,
+            merged_output_dir=in_path.parent,
             merged_name=merged_name,
             ass=args.ass,
             txt_events_path=txt_path,
         )
-        print(f"ass:{args.ass}")
         print(f"Done merge: {merged_path}")
+
+        del whisper_model
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-
     main()
